@@ -1,0 +1,50 @@
+# --- Binarios y Archivos Pesados (CAD/Simulación) ---
+*.stl
+*.step
+*.stp
+*.obj
+*.out
+*.bin
+*.elf
+*.hex
+
+# --- MATLAB & Simulink ---
+*.asv
+*.slxc
+*.mex*
+*.log
+slprj/
+*.mat
+# Si necesitas guardar datos específicos de sensores en .mat, comenta la línea anterior
+
+# --- ANSYS & CFD ---
+*.log
+*.err
+*.bak
+*.clog
+*_files/
+*.auto
+*.dsdb
+*.db
+*.engd
+*.msg
+
+# --- STM32 / IDEs (CubeIDE, Keil, VS Code) ---
+.project
+.cproject
+.settings/
+Debug/
+Release/
+bin/
+obj/
+.vscode/
+*.swp
+
+# --- Sistema Operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Git LFS (Opcional si decides usarlo para algunos CADs) ---
+# Si usas LFS, no ignores los archivos que quieres trackear,
+# pero sí ignora los archivos temporales de Git
