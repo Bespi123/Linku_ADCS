@@ -67,10 +67,10 @@ disp('Simulación completada.');
 %% 4. POST-PROCESAMIENTO Y GRÁFICOS
 
 % --- Gráfico 1: Órbita 3D ---
-figure('Name', 'Trayectoria Orbital 3D');
+figure('Name', '3D Orbital Trajectory');
 plot3(y_out(:,1)/1e3, y_out(:,2)/1e3, y_out(:,3)/1e3, 'b');
 hold on;
-title('Órbita Propagada (ECI)');
+title('Propagated Orbit (ECI)');
 xlabel('X (km)');
 ylabel('Y (km)');
 zlabel('Z (km)');
@@ -83,41 +83,41 @@ surf(x_e*params.R_earth/1e3, y_e*params.R_earth/1e3, z_e*params.R_earth/1e3, ...
      'FaceColor', 'red', 'EdgeColor', 'none', 'FaceAlpha', 0.5);
 
 % --- Gráfico 2: Evolución de la Altitud ---
-figure('Name', 'Evolución de la Altitud');
+figure('Name', 'Altitude Evolution');
 % Calcular magnitud del vector de posición en cada paso
 r_mag = vecnorm(y_out(:, 1:3), 2, 2);
 % Calcular altitud
 alt = r_mag - params.R_earth;
 plot(t_out / 3600, alt / 1e3); % Tiempo en horas, altitud en km
-title('Altitud vs. Tiempo');
-xlabel('Tiempo (horas)');
-ylabel('Altitud (km)');
+title('Altitude vs. Time');
+xlabel('Time (hours)');
+ylabel('Altitude (km)');
 grid on;
 
 % --- Gráfico 3: Posición en ECI ---
-figure('Name', 'Posición ECI vs. Tiempo');
+figure('Name', 'ECI Position vs. Time');
 
 % Subplot 1: Componente X
 subplot(3,1,1)
 plot(t_out / 3600, y_out(:,1)/1000);
 grid on;
-ylabel('Posición X (km)');
+ylabel('X Position (km)');
 
 % Subplot 2: Componente Y
 subplot(3,1,2)
 plot(t_out / 3600, y_out(:,2)/1000);
 grid on;
-ylabel('Posición Y (km)');
+ylabel('Y Position (km)');
 
 % Subplot 3: Componente Z
 subplot(3,1,3)
 plot(t_out / 3600, y_out(:,3)/1000);
 grid on;
-ylabel('Posición Z (km)');
-xlabel('Tiempo (horas)'); % El xlabel solo es necesario en el último gráfico
+ylabel('Z Position (km)');
+xlabel('Time (hours)'); % El xlabel solo es necesario en el último gráfico
 
 % Añadir un título general a toda la figura (para MATLAB R2018b y posteriores)
-sgtitle('Evolución de las Componentes de Posición (ECI)');
+sgtitle('Evolution of Position Components (ECI)');
 
 %% --------------------------------------------------------------------------
 %  --- FUNCIONES LOCALES REQUERIDAS ---

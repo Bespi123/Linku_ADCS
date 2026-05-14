@@ -22,13 +22,13 @@ sat.Is = [Ixx,  Ixy,  Ixz;
 
 sat.mass = 20.0;
 
-%% Actuadores: Magnetorquers (MQ800 Model)
-actuators.magnetorquer.power            = 360e-3;       % W
-actuators.magnetorquer.MaxPower         = 360e-3;       % W
+%% Actuadores: Magnetorquers (iADCS400 Model)
+actuators.magnetorquer.power            = 600e-3;       % W (Típicamente ~0.6W por eje a 5V)
+actuators.magnetorquer.MaxPower         = 600e-3;       % W
 actuators.magnetorquer.voltage          = 5;            % V
-actuators.magnetorquer.dimensions       = [70,10,10];   % mm (l,w,h)
-actuators.magnetorquer.nominalDipole    = 0.2;          % A m^2
-actuators.magnetorquer.maxNominalDipole = 0.2;          % A m^2
+actuators.magnetorquer.dimensions       = [80,10,10];   % mm (l,w,h) - Longitud del núcleo
+actuators.magnetorquer.nominalDipole    = 0.4;          % A m^2 (0.4 Am^2 es estándar en serie 400)
+actuators.magnetorquer.maxNominalDipole = 0.4;          % A m^2
 
 % Área (m^2) usando mm -> m: A = (h*l) [mm^2] * 1e-6
 actuators.magnetorquer.A  = actuators.magnetorquer.dimensions(2) * actuators.magnetorquer.dimensions(3) * 1e-6;
@@ -37,10 +37,26 @@ actuators.magnetorquer.n  = actuators.magnetorquer.nominalDipole * actuators.mag
                             (actuators.magnetorquer.A * actuators.magnetorquer.power);
 actuators.magnetorquer.maxCurrent = actuators.magnetorquer.maxNominalDipole / actuators.magnetorquer.voltage;
 
+% Parámetros del Núcleo (Histéresis Simplificada)
+actuators.magnetorquer.residualDipole = [0.004; -0.002; 0.003]; % ~1% del dipolo máximo típico
+actuators.magnetorquer.linearityFactor = 2.0; % Factor de curvatura suave B-H (tanh)
+
 %% Sensores: Magnetómetro
-sensors.mag.desvEst = 50.00e-9; % T (ruido)
-sensors.mag.res     = 31.25e-9; % T (resolución)
+sensors.mag.desvEst = 150.00e-9; % T (ruido MEMS comercial típico)
+sensors.mag.res     = 10.00e-9;  % T (resolución mejorada)
 sensors.mag.normDesvEst = 0.5;
+sensors.mag.tau     = 0.5;      % Constante de tiempo del filtro Pasa-Bajo [s]
+
+%% Sensores: Giroscopio (IMU Model)
+sensors.gyro.scaleFactor = [0.005; 0.005; 0.005]; % 0.5% error de escala
+sensors.gyro.misalign = [0, 0.001, 0.001; 0.001, 0, 0.001; 0.001, 0.001, 0]; % m_ij [rad]
+sensors.gyro.noiseStd = deg2rad(0.05); % Ruido blanco eta_g [rad/s] mejorado
+sensors.gyro.biasWalkStd = deg2rad(0.005); % Inestabilidad del bias sigma_RW [rad/s / sqrt(s)]
+sensors.gyro.tau = 0.1; % Constante de tiempo del filtro Pasa-Bajo [s]
+sensors.gyro.yMin = deg2rad(-250); % Límite de saturación inferior
+sensors.gyro.yMax = deg2rad(250);  % Límite de saturación superior
+sensors.gyro.bits = 16; % n_bits del ADC
+sensors.gyro.Vref = 3.3; % Voltaje de referencia del ADC
 
 %% 2) PARÁMETROS AMBIENTALES Y ORBITALES
 earth.Radius       = 6378e3;
@@ -69,22 +85,26 @@ initial.attitude.rpy0_deg = [10, -10, 5];
 initial.attitude.rpy0_rad = deg2rad(initial.attitude.rpy0_deg');
 initial.attitude.q0123_0  = eul2quat(initial.attitude.rpy0_rad')';  % scalar-first
 
-initial.omega.omega0_x = deg2rad(10); %
-initial.omega.omega0_y = deg2rad(-10);
-initial.omega.omega0_z = deg2rad(10);
+%% 3.1) CONFIGURACIÓN DE CONTROL (PID & B-DOT)
+ctrl.Kp = 8e-5;
+ctrl.Ki = 5e-5; % Incrementado 100x para vencer la remanencia del núcleo y perturbaciones
+ctrl.Kd = 3e-3;
+ctrl.limit_int = 50;
+ctrl.bang_bang_factor = 1e3; % Factor multiplicador para forzar frenado agresivo
+
+% Ganancia teórica para el controlador B-Dot (Cross-Product)
+% K_bdot = [4*pi*(1+sin(i))*I_min] / [T_orb * B_avg^2]
+B_avg = 40e-6; % Campo magnético promedio en LEO (~40,000 nT convertido a Tesla)
+ctrl.k_bdot = (4 * pi / orbit.period) * (1 + sin(deg2rad(orbit.inclination))) * min(diag(sat.Is)) / (B_avg^2);
 
 %% 4) CONFIGURACIÓN DE SIMULACIÓN
 settings.startTime = datetime(2025,10,10,23,30,00);
 settings.startTime.TimeZone = "UTC";
 
-settings.number_of_orbits = 5;
+settings.number_of_orbits = 10; % 10 órbitas para dar margen físico de frenado
 settings.sample_step = 100;
 settings.t_final = orbit.period * settings.number_of_orbits;
 settings.orbit_period = orbit.period;                 
-settings.X0 = [initial.attitude.q0123_0;
-               initial.omega.omega0_x;
-               initial.omega.omega0_y;
-               initial.omega.omega0_z];
 
 %% 5) Configuracion de computadora de abordo
 state_ant = 0;
@@ -175,33 +195,61 @@ env.dip = dip;                       % Nx1 en grados (según wrldmagm)
 
 disp('Pre-cálculo completado.');
 
-%% 6) SIMULACIÓN (ODE45) + WAITBAR OUTPUTFCN
-disp('Iniciando Simulación...');
-settings.hWaitbar = waitbar(0, 'Progress: 0%','Name', 'LINKU-SAT A Simulation Progress');
+%% 6) MONTE CARLO & SIMULACIÓN (ODE45)
+num_mc_runs = 5; % Cambiar a 1 para simulación única, >1 para Monte Carlo
 
-opts = odeset( ...
-    'InitialStep', 1e-4, ...
-    'RelTol', 1e-6, ...
-    'OutputFcn', @(t,y,flag) odeWaitbar(t,y,flag,settings) ...
-);
+mc_detumble_times = NaN(num_mc_runs, 1);
+mc_energy = NaN(num_mc_runs, 1);
+mc_omega_hist = cell(num_mc_runs, 1);
+mc_time_hist = cell(num_mc_runs, 1);
+nominal_Is = sat.Is;
 
-tic
-[tout, x] = ode45(@(t,x) satellite_detumbling(t, x, sat, disturbance, sensors, settings, env), ...
-                  [0 settings.t_final], settings.X0, opts);
-elapsedTime = toc;
+disp('Iniciando Simulaciones...');
 
-if isa(settings.hWaitbar,'handle') && isvalid(settings.hWaitbar)
-    close(settings.hWaitbar);
-end
+for mc_iter = 1:num_mc_runs
+    fprintf('\n--- Iteración Monte Carlo %d / %d ---\n', mc_iter, num_mc_runs);
+    
+    % 1. Aleatorizar Condiciones (Tasas de eyección realistas: entre -5 y +5 deg/s)
+    initial.omega.omega0_x = deg2rad(10 * rand() - 5);
+    initial.omega.omega0_y = deg2rad(10 * rand() - 5);
+    initial.omega.omega0_z = deg2rad(10 * rand() - 5);
+    
+    % 2. Aleatorizar Tensor de Inercia (+/- 10% de variación gaussiana)
+    err_Is = 0.10 * randn(3,3);
+    err_Is = (err_Is + err_Is')/2;
+    sat.Is = nominal_Is .* (1 + err_Is);
+    
+    % 3. Actualizar ganancia y Vector de Estado inicial
+    ctrl.k_bdot = (4 * pi / orbit.period) * (1 + sin(deg2rad(orbit.inclination))) * min(diag(sat.Is)) / (B_avg^2);
+    settings.X0 = [initial.attitude.q0123_0; initial.omega.omega0_x; initial.omega.omega0_y; initial.omega.omega0_z; 0; 0; 0];
+    
+    % 4. Ejecutar Integrador
+    if num_mc_runs == 1
+        settings.hWaitbar = waitbar(0, 'Progress: 0%','Name', 'LINKU-SAT A Simulation Progress');
+        opts = odeset('InitialStep', 1e-4, 'RelTol', 1e-6, 'OutputFcn', @(t,y,flag) odeWaitbar(t,y,flag,settings));
+    else
+        opts = odeset('InitialStep', 1e-4, 'RelTol', 1e-6); % Sin waitbar para acelerar cálculo masivo
+    end
+    
+    tic
+    [tout, x] = ode45(@(t,x) satellite_detumbling(t, x, sat, disturbance, sensors, settings, env, ctrl, actuators), ...
+                      [0 settings.t_final], settings.X0, opts);
+    elapsedTime = toc;
+    fprintf('Simulación completada en %.2f segundos.\n', elapsedTime);
+    
+    if num_mc_runs == 1 && isa(settings.hWaitbar,'handle') && isvalid(settings.hWaitbar)
+        close(settings.hWaitbar);
+    end
+    
+    mc_time_hist{mc_iter} = tout / 3600;
+    mc_omega_hist{mc_iter} = rad2deg(vecnorm(x(:,5:7), 2, 2));
 
-fprintf('Simulación completada en %.2f segundos.\n', elapsedTime);
-
-%% 7) POST-PROCESO (RECONSTRUCCIÓN CON LÓGICA DE ESTADOS)
-disp('Reconstructing variables with state synchronization...');
-len_out = length(tout);
+    %% 7) POST-PROCESO DE ESTA ITERACIÓN
+    len_out = length(tout);
 
 % Pre-allocation
 B_body_meas    = zeros(3, len_out);
+B_body_true_rec= zeros(3, len_out); % Array para almacenar el campo verdadero
 Torque_ctrl    = zeros(3, len_out);
 Mag_moment     = zeros(3, len_out);
 Currents       = zeros(3, len_out);
@@ -216,21 +264,24 @@ state_ant_post = 0;
 t_event_post = -1;
 t_event_first = NaN; 
 
-% Variables para reconstrucción del PID
-integral_error_post = [0; 0; 0]; % Acumulador para post-proceso
+% Variables IMU post-proceso
+bias_g_post = [0;0;0];
+w_filt_post = x(1, 5:7)';
+mag_noise_post = [0;0;0];
+B_in_ref0 = interp1(env.time, env.B_inertial, tout(1), 'linear', 'extrap')';
+B_filt_post = quatRotation(quatconj(x(1, 1:4)), B_in_ref0);
 
 for i = 1:len_out
     t_curr = tout(i);
     q_curr = x(i, 1:4)'; 
     w_curr = x(i, 5:7)'; 
+    int_err_curr = x(i, 8:10)'; % Recuperamos el error integrado por ode45
     
     % --- Onboard Computer State Logic ---
     if state_ant_post == 0 && norm(w_curr) < deg2rad(1)
         state_curr = 1;
         t_event_post = t_curr;
         if isnan(t_event_first), t_event_first = t_curr; end
-    elseif state_ant_post == 1 && (t_curr - t_event_post >= 3600)
-        state_curr = 2;
     else
         state_curr = state_ant_post;
     end
@@ -241,17 +292,31 @@ for i = 1:len_out
     B_in_ref = interp1(env.time, env.B_inertial, t_curr, 'linear', 'extrap')'; 
     dip_ref  = interp1(env.time, env.dip, t_curr, 'linear', 'extrap');
     B_body_true = quatRotation(quatconj(q_curr'), B_in_ref);
-    B_body_meas(:,i) = mag_model(B_body_true, sensors.mag.desvEst, sensors.mag.res);
+    B_body_true_rec(:,i) = B_body_true; % Guardamos el campo real para graficar
     T_dist_rec(:,i) = disturbance(t_curr);
+
+    % --- Consistent IMU Reconstruction ---
+    dt = 0;
+    if i > 1
+        dt = tout(i) - tout(i-1);
+    end
+    
+    [B_body_meas(:,i), mag_noise_post, B_filt_post] = imu_mag_model(B_body_true, dt, mag_noise_post, B_filt_post, sensors);
+    [w_meas, bias_g_post, w_filt_post] = imu_gyro_model(w_curr, dt, bias_g_post, w_filt_post, sensors);
+    state_meas = [q_curr; w_meas; int_err_curr];
 
     % --- Control Reconstruction based on State ---
     if state_curr == 0 || state_curr == 1
-        % B-dot Control for Detumbling and Settling
-        min_inertia = min(diag(sat.Is));
-        omega_orbit = 2*pi/settings.orbit_period;
-        k_val = 2 * omega_orbit * (1 + sin(deg2rad(dip_ref))) * min_inertia * 8e9;
+        % B-dot Puro (Sin giroscopio) + Bang-Bang
+        k_val = ctrl.k_bdot * ctrl.bang_bang_factor;
         K_gain_rec(i) = k_val;
-        [T_applied, M_applied] = detumblingControl([q_curr; w_curr], k_val, B_body_meas(:,i));
+        
+        % Derivada continua (analítica) para B-Dot: B_dot = -w x B
+        % Es matemáticamente estable y evita ruido numérico
+        B_dot_post = -cross(w_meas, B_body_meas(:,i));
+        
+        [T_applied, M_applied] = detumblingControl_PureBDot(B_dot_post, k_val, B_body_meas(:,i), actuators);
+        [~, curr_vec] = magnetorquer_model(M_applied, actuators); % Extraer corriente real consumida
     else
         % PD Control for Nominal Alignment (State 2)
         v_vel_eci = interp1(env.time, env.Vel_inertial', t_curr, 'linear', 'extrap')';
@@ -264,38 +329,42 @@ for i = 1:len_out
             % Inyectamos un pequeño error ficticio en X para forzar el giro
             error_vec = [0.1; 0; 0]; 
         end
-        % Reconstrucción del Integrador (dt variable)
-        if i > 1
-            dt = tout(i) - tout(i-1);
+        
+        % Reconstruimos T_pid deseado
+        int_err_sat = max(min(int_err_curr, ctrl.limit_int), -ctrl.limit_int);
+        T_pid_desired = (ctrl.Kp * error_vec) + (ctrl.Ki * int_err_sat) - (ctrl.Kd * w_meas);
+        
+        % Reconstruimos el Cross-Product Steering
+        B_meas = B_body_meas(:,i);
+        B_norm_sq = norm(B_meas)^2;
+        if B_norm_sq > 1e-15
+            M_cmd = cross(B_meas, T_pid_desired) / B_norm_sq;
         else
-            dt = 0;
+            M_cmd = [0;0;0];
         end
-        integral_error_post = integral_error_post + error_vec * dt;
         
-        % Anti-windup (mismo límite que en simulación)
-        limit_int = 50;
-        integral_error_post = max(min(integral_error_post, limit_int), -limit_int);
+        % Compensación de Software: Restamos el dipolo residual esperado para anularlo
+        M_cmd = M_cmd - actuators.magnetorquer.residualDipole;
         
-        % 5. GANANCIAS PID RELAJADAS
-        % Kp: Lo suficiente para orientar el satélite sin brusquedad
-        Kp = 8e-5; 
-        % Ki: Muy bajo, para eliminar el error de 1.3° en el transcurso de una órbita
-        Ki = 5e-7; 
-        % Kd: Amortiguamiento suave
-        Kd = 3e-3;
-        
-        % Torque Objetivo (PID)
-        T_applied = (Kp * error_vec) + (Ki * integral_error_post) - (Kd * w_curr);
+        % Pasamos comando por el Modelo de Magnetorquer
+        [M_applied, curr_vec] = magnetorquer_model(M_cmd, actuators);
+        T_applied = cross(M_applied, B_meas);
         
     end
 
     % --- Store Power & Actuator data ---
     Torque_ctrl(:,i) = T_applied;
     Mag_moment(:,i)  = M_applied;
-    curr_vec = M_applied / (actuators.magnetorquer.n * actuators.magnetorquer.A);
     Currents(:,i) = curr_vec;
     Power_inst(i) = sum(abs(curr_vec)) * actuators.magnetorquer.voltage;
 end
+    
+    % Guardar métricas Monte Carlo
+    mc_detumble_times(mc_iter) = t_event_first / 3600; % horas
+    mc_energy(mc_iter) = trapz(tout, Power_inst); % Joules
+    fprintf('Detumbling: %.2f horas | Energía: %.2f J\n', mc_detumble_times(mc_iter), mc_energy(mc_iter));
+    
+end % Fin del bucle Monte Carlo
 
 %% 8) ENHANCED PLOTS
 % Interpolamos los datos pre-calculados del escenario SGP4 al vector de tiempo de la ODE
@@ -422,23 +491,95 @@ subplot(2,1,2)
     title('Control Torque Magnitude');
 linkaxes(findall(gcf,'type','axes'),'x');
 
+% Figure 5: Magnetic Field: True vs Measured
+figure('Name','Magnetic Field: True vs Measured','Color','w');
+
+subplot(3,1,1);
+plot(t_hours, B_body_true_rec(1,:)*1e9, 'k', 'LineWidth', 1.5); hold on; grid on;
+plot(t_hours, B_body_meas(1,:)*1e9, 'r--', 'LineWidth', 1.0);
+ylabel('B_x (nT)'); title('Magnetic Field (Body Frame) - True vs Measured');
+legend('True Model', 'Measured (Sensor)', 'Location', 'eastoutside');
+
+subplot(3,1,2);
+plot(t_hours, B_body_true_rec(2,:)*1e9, 'k', 'LineWidth', 1.5); hold on; grid on;
+plot(t_hours, B_body_meas(2,:)*1e9, 'g--', 'LineWidth', 1.0);
+ylabel('B_y (nT)');
+legend('True Model', 'Measured (Sensor)', 'Location', 'eastoutside');
+
+subplot(3,1,3);
+plot(t_hours, B_body_true_rec(3,:)*1e9, 'k', 'LineWidth', 1.5); hold on; grid on;
+plot(t_hours, B_body_meas(3,:)*1e9, 'b--', 'LineWidth', 1.0);
+ylabel('B_z (nT)'); xlabel('Time (h)');
+legend('True Model', 'Measured (Sensor)', 'Location', 'eastoutside');
+
+linkaxes(findall(gcf,'type','axes'),'x');
+
+% --- MONTE CARLO PLOTS ---
+if num_mc_runs > 1
+    figure('Name','Monte Carlo: Comprehensive Performance Analysis','Color','w', 'Position', [100, 100, 1200, 800]);
+    
+    % Función anónima para calcular la curva Normal (Gaussiana)
+    gaussian_pdf = @(x, mu, sig) (1 ./ (sig * sqrt(2*pi))) .* exp(-0.5 * ((x - mu)./sig).^2);
+    
+    % 1. Distribución de Tiempos de Detumbling
+    subplot(2,2,1);
+    valid_times = mc_detumble_times(~isnan(mc_detumble_times));
+    if ~isempty(valid_times)
+        mu_t = mean(valid_times); sig_t = std(valid_times);
+        histogram(valid_times, 15, 'Normalization', 'pdf', 'FaceColor', '#0072BD', 'EdgeColor', 'w'); hold on;
+        x_t = linspace(min(valid_times)-sig_t, max(valid_times)+sig_t, 100);
+        plot(x_t, gaussian_pdf(x_t, mu_t, sig_t), 'r-', 'LineWidth', 2);
+        title(sprintf('Detumbling Time Distribution (\\mu = %.2fh, \\sigma = %.2fh)', mu_t, sig_t));
+        xlabel('Time (Hours)'); ylabel('Probability Density'); grid on;
+    end
+    
+    % 2. Distribución de Consumo Energético
+    subplot(2,2,2);
+    valid_energy = mc_energy(~isnan(mc_energy));
+    if ~isempty(valid_energy)
+        mu_e = mean(valid_energy); sig_e = std(valid_energy);
+        histogram(valid_energy, 15, 'Normalization', 'pdf', 'FaceColor', '#D95319', 'EdgeColor', 'w'); hold on;
+        x_e = linspace(min(valid_energy)-sig_e, max(valid_energy)+sig_e, 100);
+        plot(x_e, gaussian_pdf(x_e, mu_e, sig_e), 'k-', 'LineWidth', 2);
+        title(sprintf('Energy Consumed Distribution (\\mu = %.0f J, \\sigma = %.0f J)', mu_e, sig_e));
+        xlabel('Total Energy (Joules)'); ylabel('Probability Density'); grid on;
+    end
+    
+    % 3. Evolución de Magnitud Angular de Todas las Simulaciones
+    subplot(2,2,[3 4]);
+    hold on; grid on;
+    for k = 1:num_mc_runs
+        plot(mc_time_hist{k}, mc_omega_hist{k}, 'LineWidth', 0.8, 'Color', [0.5 0.5 0.5 0.6]);
+    end
+    yline(1.0, 'r--', 'Requirement (1 deg/s)', 'LineWidth', 2);
+    title('Angular Velocity Magnitude Overview (All Monte Carlo Iterations)');
+    xlabel('Time (Hours)'); ylabel('|\omega| (deg/s)');
+end
+
 %% ==================== FUNCIONES LOCALES ====================
 
-function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
+function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, ctrl, actuators)
 % SATELLITE_DETUMBLING  Dinámica rígida + control magnético PID
     
-    % --- Variables Persistentes para Lógica de Estados e Integrador ---
-    persistent state_ant integral_error t_prev
+    % --- Variables Persistentes para Lógica de Estados e IMU ---
+    persistent state_ant t_prev bias_g w_filt mag_noise B_filt
     
     if isempty(state_ant)
         state_ant = 0; % Estado inicial: Detumbling
+        t_prev = t;
+        bias_g = [0;0;0]; % b_g(t=0) Bias inicial
+        w_filt = x(5:7);  % Inicializamos el filtro digital para evitar picos
+        mag_noise = [0;0;0];
+        B_in_ref0 = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')';
+        B_filt = quatRotation(quatconj(x(1:4)'), B_in_ref0);
     end
-    if isempty(integral_error)
-        integral_error = [0; 0; 0]; % Acumulador del error (Vector 3x1)
-    end
-    if isempty(t_prev)
-        t_prev = 0;
-    end
+    
+    integral_error = x(8:10); % Variable de estado proveniente del ode45
+    d_int = [0;0;0];          % Derivada inicial del integrador del PID
+    
+    % Calculamos dt explícito para el Random Walk y el filtro discreto de la IMU
+    dt = t - t_prev;
+    if dt < 0; dt = 0; end % Prevenir pasos hacia atrás de ode45
     
     % 1) Interpolación del entorno
     B_inertial_ref = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')'; 
@@ -448,24 +589,26 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
     q = x(1:4);
     B_body_true = quatRotation(quatconj(q'), B_inertial_ref); 
     
-    % 4) Ganancia K para B-dot
-    min_inertia = min(diag(sat.Is));
-    omega_orbit = 2*pi/settings.orbit_period;
-    
     % 3) Computadora de abordo (Determina el Estado)
     state = onboardComputer(t, state_ant, x);
     
-    % Sensor (ruido + cuantización)
-    B_body_meas = mag_model(B_body_true, sensors.mag.desvEst, sensors.mag.res); 
+    % Sensor (ruido congelado + cuantización + filtro pasa-bajo)
+    [B_body_meas, mag_noise, B_filt] = imu_mag_model(B_body_true, dt, mag_noise, B_filt, sensors);
+
+    % IMU (Medición para TODOS los estados)
+    [w_meas, bias_g, w_filt] = imu_gyro_model(x(5:7), dt, bias_g, w_filt, sensors);
+    state_meas = x;
+    state_meas(5:7) = w_meas;
 
     % --- LÓGICA DE CONTROL ---
     if state == 0 || state == 1 
-        % >> Estado 0/1: B-Dot (Detumbling)
-        % Reiniciamos el integrador para que empiece limpio en el Estado 2
-        integral_error = [0; 0; 0]; 
+        % >> Estado 0/1: B-Dot Puro (Sin Giroscopio) + Bang-Bang
         
-        k = 2 * omega_orbit * (1 + sin(deg2rad(dip_ref))) * min_inertia * 8e9;
-        [T_control, ~] = detumblingControl(x, k, B_body_meas); 
+        % B_dot analítico para estabilidad extrema del integrador ode45
+        B_dot = -cross(w_meas, B_body_meas);
+        
+        k_val = ctrl.k_bdot * ctrl.bang_bang_factor;
+        [T_control, ~] = detumblingControl_PureBDot(B_dot, k_val, B_body_meas, actuators); 
     
     else
         % >> Estado 2: Alineación Nominal (PID)
@@ -487,39 +630,37 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
                 u = [0.1; 0; 0]; % Empujón para salir del equilibrio inestable
             end
             
-            % D. Cálculo del Término Integral (PID)
-            dt = t - t_prev;
-            if dt < 0, dt = 0; end % Protección contra pasos atrás del solver
+            % D. Pasamos la derivada del error a ode45 para que lo integre
+            d_int = u; 
             
-            % Acumulación (Integración de Euler)
-            integral_error = integral_error + u * dt;
+            % E. Anti-Windup (Limitamos su acción)
+            int_err_sat = max(min(integral_error, ctrl.limit_int), -ctrl.limit_int);
             
-            % Anti-Windup: Limitar el error integral para que no crezca infinito
-            % Esto evita oscilaciones excesivas cuando el actuador se satura
-            limit_int = 50; 
-            integral_error = max(min(integral_error, limit_int), -limit_int);
-
-            % E. Ganancias PID (Sintonización Sugerida)
-            % Ganancias PID Actualizadas
-            % Kp: Lo suficiente para orientar el satélite sin brusquedad
-            Kp = 8e-5; 
-            % Ki: Muy bajo, para eliminar el error de 1.3° en el transcurso de una órbita
-            Ki = 5e-7; 
-            % Kd: Amortiguamiento suave
-            Kd = 3e-3;
+            % F. Ley de Control PID Ideal (Torque deseado)
+            T_pid_desired = (ctrl.Kp * u) + (ctrl.Ki * int_err_sat) - (ctrl.Kd * w_meas); 
             
-            % F. Ley de Control PID
-            % T = P + I - D
-            T_control = (Kp * u) + (Ki * integral_error) - (Kd * x(5:7)); 
+            % G. CROSS-PRODUCT STEERING: Traducir Torque Deseado a Dipolo Real (Magnetorquers)
+            B_norm_sq = norm(B_body_meas)^2;
+            if B_norm_sq > 1e-15
+                M_cmd = cross(B_body_meas, T_pid_desired) / B_norm_sq;
+            else
+                M_cmd = [0;0;0];
+            end
+            
+            % H. Compensación de Histéresis: Restamos el dipolo residual esperado
+            M_cmd = M_cmd - actuators.magnetorquer.residualDipole;
+            
+            % Pasamos el comando por el Modelo Físico del Magnetorquer
+            [M_sat, ~] = magnetorquer_model(M_cmd, actuators);
+            
+            % Torque real aplicado a la planta
+            T_control = cross(M_sat, B_body_meas);
             
         catch
             T_control = [0;0;0];
         end 
     end
     
-    % Actualizar tiempo previo para el siguiente paso
-    t_prev = t;
-
     % 6) Disturbios
     T_dist = dist(t); T_dist = T_dist(:);
     
@@ -527,31 +668,56 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
     T_total = T_dist + T_control;
     
     % 8) Dinamicas del satelite
-    x_dot = satellite_dynamics(x, sat, T_total);
+    x_dot_dyn = satellite_dynamics(x, sat, T_total);
+    x_dot = [x_dot_dyn; d_int]; % Añadimos la integración del PID al vector
     
     % 9) Update state
     state_ant = state;
+    
+    % Actualizar tiempo para la IMU si el solver avanzó
+    if dt > 0
+        t_prev = t;
+    end
 end
 
-function [Tc, muB_sat] = detumblingControl(state, k, B_body)
-% DETUMBLINGCONTROL  Ley tipo B-dot: mu = k (w x B), Tc = mu x B
-    omega = state(5:7); omega = omega(:);
+function [Tc, muB_sat] = detumblingControl_PureBDot(B_dot, k, B_body, actuators)
+% DETUMBLINGCONTROL_PUREBDOT  Ley B-dot puro (Sin IMU): mu = -k * B_dot
+    B_dot = B_dot(:);
     B_body = B_body(:);
 
-    muB = k * cross(omega, B_body);
+    muB = -k * B_dot;
 
-    % Saturación por dipolo máximo (0.2 A m^2)
-    muB_sat = max(min(muB, 0.2), -0.2);
+    % Modelo Físico de saturación del actuador
+    [muB_sat, ~] = magnetorquer_model(muB, actuators);
 
     Tc = cross(muB_sat, B_body);
 end
 
-function mag_bm = mag_model(mag_b, sig_tam, sig_res)
-% MAG_MODEL  Magnetómetro: ruido blanco + cuantización
-% Entrada/salida en 3x1
-    mag_b = mag_b(:);
-    mag_b_noise = mag_b + sig_tam*randn(3,1);
-    mag_bm = round(mag_b_noise./sig_res).*sig_res;
+function [B_meas, noise_new, B_filt_new] = imu_mag_model(B_true, dt, noise_old, B_filt_old, sensors)
+% IMU_MAG_MODEL Simula ruido, cuantización y filtro pasa-bajo del magnetómetro
+    
+    % 1. Generación de ruido (congelado en sub-pasos de ode45)
+    if dt > 0
+        eta_m = sensors.mag.desvEst * randn(3,1);
+        noise_new = eta_m;
+    else
+        noise_new = noise_old;
+    end
+    
+    B_raw = B_true(:) + noise_new;
+    
+    % 2. Cuantización (Resolución del sensor)
+    B_quant = round(B_raw ./ sensors.mag.res) .* sensors.mag.res;
+    
+    % 3. Filtro Pasa-Bajo Digital
+    if dt > 0
+        alpha = dt / (sensors.mag.tau + dt);
+        B_filt_new = (1 - alpha) * B_filt_old(:) + alpha * B_quant;
+    else
+        B_filt_new = B_filt_old(:); 
+    end
+    
+    B_meas = B_filt_new;
 end
 
 function rotX = quatRotation(q, x)
@@ -679,17 +845,80 @@ function state = onboardComputer(t, state_ant, x)
         fprintf('At t=%.2f s: Target reached. State 0 -> 1. Timer started.\n', t);
         
     elseif state_ant == 1
-        % Estamos en el estado 1, verificamos si ya pasó 1 hora (3600 s)
-        tiempo_transcurrido = t - t_event;
-        
-        if tiempo_transcurrido >= 3600
-            state = 2; % Cambiar a Estado 2 (ej. Apuntamiento Nominal)
-            fprintf('At t=%.2f s: 1 hour passed in State 1. Switching to State 2.\n', t);
-        else
-            state = 1; % Seguir en Estado 1
-        end
+        % Nos mantenemos en el Estado 1 indefinidamente (Solo Detumbling)
+        state = 1; 
         
     else
         state = state_ant; % Mantener el estado actual (Estado 2 u otros)
     end
+end
+
+function [M_real, I_real] = magnetorquer_model(M_cmd, actuators)
+% MAGNETORQUER_MODEL Simula el comportamiento físico del actuador electromagnético.
+% Convierte el dipolo comandado a corriente requerida, aplica límites de hardware 
+% (saturación de amperaje), y modela la curva B-H del núcleo ferromagnético 
+% incluyendo saturación suave e histéresis estática (remanencia).
+
+    n = actuators.magnetorquer.n;
+    A = actuators.magnetorquer.A;
+    I_max = actuators.magnetorquer.maxCurrent; % Límite de corriente del hardware
+    M_max = actuators.magnetorquer.maxNominalDipole;
+    M_rem = actuators.magnetorquer.residualDipole;
+    k_lin = actuators.magnetorquer.linearityFactor;
+
+    % 1. Corriente ideal requerida por eje (I = M / (n*A))
+    I_cmd = M_cmd / (n * A);
+
+    % 2. Saturación impuesta por la electrónica de potencia (Driver)
+    I_real = max(min(I_cmd, I_max), -I_max);
+
+    % 3. Modelo del Núcleo (Saturación suave y Remanencia Magnética)
+    % La función tanh() imita la curva de saturación magnética del hierro.
+    % M_rem simula el magnetismo que "retiene" el núcleo cuando I = 0.
+    M_core = M_max * tanh(k_lin * (I_real / I_max)) + M_rem;
+    
+    % 4. Dipolo real generado (con límite físico absoluto de seguridad)
+    M_real = max(min(M_core, M_max), -M_max);
+end
+
+function [w_meas, bias_new, w_filt_new] = imu_gyro_model(w_true, dt, bias_old, w_filt_old, sensors)
+% IMU_GYRO_MODEL Simula los errores matemáticos de un giroscopio
+
+    % 1. Matrices de Error (Ecuación 1)
+    s = sensors.gyro.scaleFactor;
+    m = sensors.gyro.misalign;
+    
+    T_sf = diag([1+s(1), 1+s(2), 1+s(3)]);
+    T_ma = [1,      m(1,2), m(1,3);
+            m(2,1), 1,      m(2,3);
+            m(3,1), m(3,2), 1];
+            
+    % 2. Ruido e inestabilidad del Bias (Ecuaciones 2 y 3)
+    eta_g = sensors.gyro.noiseStd * randn(3,1);
+    
+    if dt > 0
+        eta_bg = sensors.gyro.biasWalkStd * sqrt(dt) * randn(3,1);
+        bias_new = bias_old + eta_bg;
+    else
+        bias_new = bias_old; % El tiempo no ha avanzado
+    end
+    
+    w_raw = T_ma * T_sf * w_true + bias_new + eta_g;
+    
+    % 3. ADC: Saturación y Cuantización Digital (Ecuaciones 7, 8 y 9)
+    w_sat = max(min(w_raw, sensors.gyro.yMax), sensors.gyro.yMin);
+    
+    levels = 2^sensors.gyro.bits - 1;
+    D_out = round( levels * (w_sat - sensors.gyro.yMin) / (sensors.gyro.yMax - sensors.gyro.yMin) );
+    w_adc = sensors.gyro.yMin + ((sensors.gyro.yMax - sensors.gyro.yMin) / levels) * D_out;
+    
+    % 4. Filtro Pasa-Bajo Digital (Ecuación 4)
+    if dt > 0
+        alpha = dt / (sensors.gyro.tau + dt);
+        w_filt_new = (1 - alpha) * w_filt_old + alpha * w_adc;
+    else
+        w_filt_new = w_filt_old; 
+    end
+    
+    w_meas = w_filt_new;
 end
