@@ -6,29 +6,46 @@ clear; clc; close all;
 %           0.000015479696200, -0.000142288034562,  0.054153798020147];
 % sat.mass = 6.843382000000000; % kg
 
-%% 1) PARÁMETROS DEL SATÉLITE (12U STANDAR)
-Ixx = 0.2785;
-Iyy = 0.2792; % Ligeramente diferente a Ixx por asimetría interna
-Izz = 0.1705;
+% % % %% 1) PARÁMETROS DEL SATÉLITE (12U STANDAR)
+% % % Ixx = 0.2785;
+% % % Iyy = 0.2792; % Ligeramente diferente a Ixx por asimetría interna
+% % % Izz = 0.1705;
 
-% Productos de inercia (típicamente 1-5% de los principales)
-Ixy = -0.005; 
-Ixz =  0.003; 
-Iyz =  0.004;
+Ixx = 0.0577;
+Iyy = 0.5777; 
+Izz = 0.0444;
+sat.mass = 5.5; % kg
+
+% % Productos de inercia (típicamente 1-5% de los principales)
+% Ixy = -0.005; 
+% Ixz =  0.003; 
+% Iyz =  0.004;
+
+Ixy =  0.001; 
+Ixz =  0.001; 
+Iyz =  -0.002;
 
 sat.Is = [Ixx,  Ixy,  Ixz;
           Ixy,  Iyy,  Iyz;
           Ixz,  Iyz,  Izz];
 
-sat.mass = 20.0;
+%sat.mass = 20.0;
 
 %% Actuadores: Magnetorquers (iADCS400 Model)
-actuators.magnetorquer.power            = 600e-3;       % W (Típicamente ~0.6W por eje a 5V)
-actuators.magnetorquer.MaxPower         = 600e-3;       % W
+% actuators.magnetorquer.power            = 600e-3;       % W (Típicamente ~0.6W por eje a 5V)
+% actuators.magnetorquer.MaxPower         = 600e-3;       % W
+% actuators.magnetorquer.voltage          = 5;            % V
+% actuators.magnetorquer.dimensions       = [80,10,10];   % mm (l,w,h) - Longitud del núcleo
+% actuators.magnetorquer.nominalDipole    = 0.4;          % A m^2 (0.4 Am^2 es estándar en serie 400)
+% actuators.magnetorquer.maxNominalDipole = 0.4;          % A m^2
+actuators.magnetorquer.power            = 360e-3;       % W
+actuators.magnetorquer.MaxPower         = 360e-3;       % W
 actuators.magnetorquer.voltage          = 5;            % V
-actuators.magnetorquer.dimensions       = [80,10,10];   % mm (l,w,h) - Longitud del núcleo
-actuators.magnetorquer.nominalDipole    = 0.4;          % A m^2 (0.4 Am^2 es estándar en serie 400)
-actuators.magnetorquer.maxNominalDipole = 0.4;          % A m^2
+actuators.magnetorquer.dimensions       = [30,30,30];   % mm (w,h,l)
+actuators.magnetorquer.nominalDipole    = 0.1;          % A m^2
+actuators.magnetorquer.maxNominalDipole = 0.1;          % A m^2
+
+
 
 % Área (m^2) usando mm -> m: A = (h*l) [mm^2] * 1e-6
 actuators.magnetorquer.A  = actuators.magnetorquer.dimensions(2) * actuators.magnetorquer.dimensions(3) * 1e-6;
@@ -105,6 +122,14 @@ settings.number_of_orbits = 10; % 10 órbitas para dar margen físico de frenado
 settings.sample_step = 100;
 settings.t_final = orbit.period * settings.number_of_orbits;
 settings.orbit_period = orbit.period;                 
+settings.enable_alignment = false; % false: evaluar solo el paso 0 -> 1 y permanecer en detumbling
+settings.stop_at_state1 = true; % true: detener ode45 cuando |omega| < 1 deg/s
+settings.fast_state1_eval = true; % true: omite reconstruccion pesada de senales tras ode45
+settings.use_parallel_mc = true; % true: usa parfor para Monte Carlo en modo fast_state1_eval
+settings.detumble_threshold = deg2rad(1);
+settings.detumble_exit_threshold = deg2rad(1.2); % Histeresis: si sube de esto, se reinicia la verificacion
+settings.state1_hold_time = 3600; % Tiempo minimo estable antes de aceptar estado 1 [s]
+settings.alignment_wait_time = 3600; % Tiempo de espera tras detumbling antes de alineamiento [s]
 
 %% 5) Configuracion de computadora de abordo
 state_ant = 0;
@@ -196,15 +221,41 @@ env.dip = dip;                       % Nx1 en grados (según wrldmagm)
 disp('Pre-cálculo completado.');
 
 %% 6) MONTE CARLO & SIMULACIÓN (ODE45)
-num_mc_runs = 5; % Cambiar a 1 para simulación única, >1 para Monte Carlo
+num_mc_runs = 50; % Cambiar a 1 para simulación única, >1 para Monte Carlo
 
 mc_detumble_times = NaN(num_mc_runs, 1);
+mc_first_cross_times = NaN(num_mc_runs, 1);
 mc_energy = NaN(num_mc_runs, 1);
 mc_omega_hist = cell(num_mc_runs, 1);
 mc_time_hist = cell(num_mc_runs, 1);
 nominal_Is = sat.Is;
 
 disp('Iniciando Simulaciones...');
+
+useParallelMc = settings.use_parallel_mc && settings.fast_state1_eval && num_mc_runs > 1 && ...
+                license('test', 'Distrib_Computing_Toolbox');
+
+if useParallelMc
+    pool = gcp('nocreate');
+    if isempty(pool)
+        parpool;
+    end
+
+    sat_mc = sat;
+    if isfield(sat_mc, 'satSGP4')
+        sat_mc = rmfield(sat_mc, 'satSGP4');
+    end
+
+    fprintf('Ejecutando Monte Carlo en paralelo (%d corridas)...\n', num_mc_runs);
+    parfor mc_iter = 1:num_mc_runs
+        [mc_detumble_times(mc_iter), mc_first_cross_times(mc_iter), mc_energy(mc_iter), mc_time_hist{mc_iter}, mc_omega_hist{mc_iter}] = ...
+            runFastState1McIteration(mc_iter, initial, nominal_Is, sat_mc, orbit, B_avg, env, ...
+                                     disturbance, sensors, settings, ctrl, actuators);
+    end
+else
+    if settings.use_parallel_mc && settings.fast_state1_eval && num_mc_runs > 1
+        disp('Parallel Computing Toolbox no disponible; ejecutando Monte Carlo en serie.');
+    end
 
 for mc_iter = 1:num_mc_runs
     fprintf('\n--- Iteración Monte Carlo %d / %d ---\n', mc_iter, num_mc_runs);
@@ -221,14 +272,36 @@ for mc_iter = 1:num_mc_runs
     
     % 3. Actualizar ganancia y Vector de Estado inicial
     ctrl.k_bdot = (4 * pi / orbit.period) * (1 + sin(deg2rad(orbit.inclination))) * min(diag(sat.Is)) / (B_avg^2);
-    settings.X0 = [initial.attitude.q0123_0; initial.omega.omega0_x; initial.omega.omega0_y; initial.omega.omega0_z; 0; 0; 0];
     
+    % Pre-calcular filtros de sensores iniciales
+    B_in_ref0 = interp1(env.time, env.B_inertial, 0, 'linear', 'extrap')';
+    B_filt0 = quatRotation(quatconj(initial.attitude.q0123_0'), B_in_ref0);
+    
+    settings.X0 = [initial.attitude.q0123_0; initial.omega.omega0_x; initial.omega.omega0_y; initial.omega.omega0_z; ...
+                   0; 0; 0; ...                                 % int_err (8:10)
+                   initial.omega.omega0_x; initial.omega.omega0_y; initial.omega.omega0_z; ... % w_filt (11:13)
+                   B_filt0; ...                                 % B_filt (14:16)
+                   0; 0; 0];                                    % bias_g (17:19)
+    
+    % Mostrar las condiciones iniciales en consola
+    fprintf('Condiciones Iniciales establecidas:\n');
+    fprintf('  Actitud inicial (Roll, Pitch, Yaw) : [%.2f, %.2f, %.2f] deg\n', initial.attitude.rpy0_deg(1), initial.attitude.rpy0_deg(2), initial.attitude.rpy0_deg(3));
+    fprintf('  Tasas de giro iniciales (X, Y, Z)  : [%.2f, %.2f, %.2f] deg/s\n', rad2deg(initial.omega.omega0_x), rad2deg(initial.omega.omega0_y), rad2deg(initial.omega.omega0_z));
+
     % 4. Ejecutar Integrador
+    if settings.stop_at_state1
+        eventFcn = @(t,x) detumblingEvent(t, x, settings);
+    else
+        eventFcn = [];
+    end
+
     if num_mc_runs == 1
         settings.hWaitbar = waitbar(0, 'Progress: 0%','Name', 'LINKU-SAT A Simulation Progress');
-        opts = odeset('InitialStep', 1e-4, 'RelTol', 1e-6, 'OutputFcn', @(t,y,flag) odeWaitbar(t,y,flag,settings));
+        opts = odeset('RelTol', 1e-6, ...
+                      'OutputFcn', @(t,y,flag) odeWaitbar(t,y,flag,settings), ...
+                      'Events', eventFcn);
     else
-        opts = odeset('InitialStep', 1e-4, 'RelTol', 1e-6); % Sin waitbar para acelerar cálculo masivo
+        opts = odeset('RelTol', 1e-6, 'Events', eventFcn); % Sin waitbar para acelerar calculo masivo
     end
     
     tic
@@ -243,6 +316,31 @@ for mc_iter = 1:num_mc_runs
     
     mc_time_hist{mc_iter} = tout / 3600;
     mc_omega_hist{mc_iter} = rad2deg(vecnorm(x(:,5:7), 2, 2));
+
+    if settings.fast_state1_eval
+        omega_norm = vecnorm(x(:,5:7), 2, 2);
+        idx_first_cross = find(omega_norm <= settings.detumble_threshold, 1, 'first');
+        idx_stable = findStableDetumbleIndex(tout, omega_norm, settings);
+        if isempty(idx_first_cross)
+            t_first_cross = NaN;
+        else
+            t_first_cross = tout(idx_first_cross);
+        end
+        if isempty(idx_stable)
+            t_event_first = NaN;
+            fprintf('Estado 1 no verificado: no se mantuvo bajo %.2f deg/s durante %.0f s.\n', ...
+                    rad2deg(settings.detumble_threshold), settings.state1_hold_time);
+        else
+            t_event_first = tout(idx_stable);
+            fprintf('Estado 1 verificado: %.2f horas bajo %.2f deg/s durante %.0f s.\n', ...
+                    t_event_first/3600, rad2deg(settings.detumble_threshold), settings.state1_hold_time);
+        end
+
+        mc_detumble_times(mc_iter) = t_event_first / 3600;
+        mc_first_cross_times(mc_iter) = t_first_cross / 3600;
+        mc_energy(mc_iter) = NaN;
+        continue;
+    end
 
     %% 7) POST-PROCESO DE ESTA ITERACIÓN
     len_out = length(tout);
@@ -264,13 +362,6 @@ state_ant_post = 0;
 t_event_post = -1;
 t_event_first = NaN; 
 
-% Variables IMU post-proceso
-bias_g_post = [0;0;0];
-w_filt_post = x(1, 5:7)';
-mag_noise_post = [0;0;0];
-B_in_ref0 = interp1(env.time, env.B_inertial, tout(1), 'linear', 'extrap')';
-B_filt_post = quatRotation(quatconj(x(1, 1:4)), B_in_ref0);
-
 for i = 1:len_out
     t_curr = tout(i);
     q_curr = x(i, 1:4)'; 
@@ -278,10 +369,13 @@ for i = 1:len_out
     int_err_curr = x(i, 8:10)'; % Recuperamos el error integrado por ode45
     
     % --- Onboard Computer State Logic ---
-    if state_ant_post == 0 && norm(w_curr) < deg2rad(1)
+    if state_ant_post == 0 && norm(w_curr) <= settings.detumble_threshold
         state_curr = 1;
         t_event_post = t_curr;
         if isnan(t_event_first), t_event_first = t_curr; end
+    elseif settings.enable_alignment && state_ant_post == 1 && t_event_post >= 0 && ...
+            (t_curr - t_event_post) >= settings.alignment_wait_time
+        state_curr = 2;
     else
         state_curr = state_ant_post;
     end
@@ -295,15 +389,10 @@ for i = 1:len_out
     B_body_true_rec(:,i) = B_body_true; % Guardamos el campo real para graficar
     T_dist_rec(:,i) = disturbance(t_curr);
 
-    % --- Consistent IMU Reconstruction ---
-    dt = 0;
-    if i > 1
-        dt = tout(i) - tout(i-1);
-    end
-    
-    [B_body_meas(:,i), mag_noise_post, B_filt_post] = imu_mag_model(B_body_true, dt, mag_noise_post, B_filt_post, sensors);
-    [w_meas, bias_g_post, w_filt_post] = imu_gyro_model(w_curr, dt, bias_g_post, w_filt_post, sensors);
-    state_meas = [q_curr; w_meas; int_err_curr];
+    % --- IMU Reconstruction (Directamente desde ode45) ---
+    % Al integrarlos como variables de estado, evitamos recalcularlos numéricamente
+    w_meas = x(i, 11:13)';
+    B_body_meas(:,i) = x(i, 14:16)';
 
     % --- Control Reconstruction based on State ---
     if state_curr == 0 || state_curr == 1
@@ -366,6 +455,102 @@ end
     
 end % Fin del bucle Monte Carlo
 
+end
+
+if settings.fast_state1_eval
+    if num_mc_runs == 1
+        t_hours = tout / 3600;
+        omega_mag_deg = rad2deg(vecnorm(x(:,5:7), 2, 2));
+
+        figure('Name','Detumbling: State 1 Verification','Color','w');
+        hold on; grid on;
+        plot(t_hours, omega_mag_deg, 'k', 'LineWidth', 1.5);
+        yline(rad2deg(settings.detumble_threshold), 'r--', 'State 1 threshold');
+        yline(rad2deg(settings.detumble_exit_threshold), 'm--', 'Reset threshold');
+        if ~isnan(mc_first_cross_times(end))
+            xline(mc_first_cross_times(end), '--b', 'First crossing', 'LabelVerticalAlignment', 'bottom');
+        end
+        if ~isnan(mc_detumble_times(end))
+            xline(mc_detumble_times(end), '--m', 'State 1 verified', 'LabelVerticalAlignment', 'bottom');
+        end
+        xlabel('Time (h)');
+        ylabel('|\omega| (deg/s)');
+        title(sprintf('State 1 verification: %.0f s hold time', settings.state1_hold_time));
+    else
+        valid_times = mc_detumble_times(~isnan(mc_detumble_times));
+        valid_first_cross = mc_first_cross_times(~isnan(mc_first_cross_times));
+        valid_both = ~isnan(mc_first_cross_times) & ~isnan(mc_detumble_times);
+        verification_delay = mc_detumble_times(valid_both) - mc_first_cross_times(valid_both);
+
+        figure('Name','Monte Carlo: State 1 Verification','Color','w', 'Position', [100, 100, 1300, 850]);
+
+        subplot(3,2,[1 2]);
+        hold on; grid on;
+        for k = 1:num_mc_runs
+            plot(mc_time_hist{k}, mc_omega_hist{k}, 'LineWidth', 0.8, 'Color', [0.45 0.45 0.45]);
+        end
+        yline(rad2deg(settings.detumble_threshold), 'r--', 'State 1 threshold', 'LineWidth', 1.5);
+        yline(rad2deg(settings.detumble_exit_threshold), 'm--', 'Reset threshold', 'LineWidth', 1.2);
+        xlabel('Time (h)');
+        ylabel('|\omega| (deg/s)');
+        title(sprintf('Angular velocity magnitude - %d Monte Carlo runs', num_mc_runs));
+
+        subplot(3,2,3);
+        if isempty(valid_first_cross)
+            text(0.5, 0.5, 'No first crossings', 'HorizontalAlignment', 'center');
+            axis off;
+        else
+            histogram(valid_first_cross, min(15, max(3, numel(valid_first_cross))), 'FaceColor', '#4DBEEE', 'EdgeColor', 'w');
+            grid on;
+            xlabel('First crossing time (h)');
+            ylabel('Runs');
+            title(sprintf('First crossings: %d / %d', numel(valid_first_cross), num_mc_runs));
+        end
+
+        subplot(3,2,4);
+        if isempty(valid_times)
+            text(0.5, 0.5, 'No verified runs', 'HorizontalAlignment', 'center');
+            axis off;
+        else
+            histogram(valid_times, min(15, max(3, numel(valid_times))), 'FaceColor', '#0072BD', 'EdgeColor', 'w');
+            grid on;
+            xlabel('Verified state 1 time (h)');
+            ylabel('Runs');
+            title(sprintf('Verified runs: %d / %d', numel(valid_times), num_mc_runs));
+        end
+
+        subplot(3,2,5);
+        if isempty(verification_delay)
+            text(0.5, 0.5, 'No verification delays', 'HorizontalAlignment', 'center');
+            axis off;
+        else
+            histogram(verification_delay, min(15, max(3, numel(verification_delay))), 'FaceColor', '#77AC30', 'EdgeColor', 'w');
+            grid on;
+            xlabel('Verification delay after first crossing (h)');
+            ylabel('Runs');
+            title('Hold-time and reset effect');
+        end
+
+        subplot(3,2,6);
+        axis off;
+        if isempty(valid_times)
+            summary_text = sprintf('First crossings: %d / %d\nVerified: 0 / %d\nHold time: %.0f s\nThreshold: %.2f deg/s\nReset: %.2f deg/s', ...
+                                   numel(valid_first_cross), num_mc_runs, num_mc_runs, settings.state1_hold_time, ...
+                                   rad2deg(settings.detumble_threshold), rad2deg(settings.detumble_exit_threshold));
+        else
+            summary_text = sprintf(['First crossings: %d / %d\nFirst mean: %.2f h\nVerified: %d / %d\nVerified mean: %.2f h\n' ...
+                                    'Verified std: %.2f h\nVerified min: %.2f h\nVerified max: %.2f h\nDelay mean: %.2f h\n' ...
+                                    'Hold time: %.0f s\nThreshold: %.2f deg/s\nReset: %.2f deg/s'], ...
+                                   numel(valid_first_cross), num_mc_runs, mean(valid_first_cross), ...
+                                   numel(valid_times), num_mc_runs, mean(valid_times), std(valid_times), ...
+                                   min(valid_times), max(valid_times), mean(verification_delay), settings.state1_hold_time, ...
+                                   rad2deg(settings.detumble_threshold), rad2deg(settings.detumble_exit_threshold));
+        end
+        text(0.05, 0.95, summary_text, 'VerticalAlignment', 'top', 'FontName', 'Consolas', 'FontSize', 11);
+    end
+    return;
+end
+
 %% 8) ENHANCED PLOTS
 % Interpolamos los datos pre-calculados del escenario SGP4 al vector de tiempo de la ODE
 xyzout = interp1(env.time, env.Pos_inertial', tout, 'linear', 'extrap'); % Posición [Nx3]
@@ -408,7 +593,9 @@ h4 = plot(t_hours, q0123out(:,4), 'b-', 'LineWidth', 1.2); % qz
 % Añadir marcadores de transición de estado
 if ~isnan(t_event_first)
     xline(t_event_first/3600, '--m', 'Settling', 'LabelVerticalAlignment', 'top','LineWidth',5);
-    xline((t_event_first + 3600)/3600, '--c', 'Alignment', 'LabelVerticalAlignment', 'top','LineWidth',5);
+    if settings.enable_alignment
+        xline((t_event_first + settings.alignment_wait_time)/3600, '--c', 'Alignment', 'LabelVerticalAlignment', 'top','LineWidth',5);
+    end
 end
 
 title('Evolution of Attitude Quaternions (Scalar-First)');
@@ -423,7 +610,9 @@ hold on; grid on;
 plot(t_hours, rad2deg(x(:,5:7)), 'LineWidth', 1.2);
 if ~isnan(t_event_first)
     xline(t_event_first/3600, '--m', 'Settling Start', 'LabelVerticalAlignment', 'bottom','LineWidth',5);
-    xline((t_event_first + 3600)/3600, '--c', 'Alignment Start', 'LabelVerticalAlignment', 'bottom','LineWidth',5);
+    if settings.enable_alignment
+        xline((t_event_first + settings.alignment_wait_time)/3600, '--c', 'Alignment Start', 'LabelVerticalAlignment', 'bottom','LineWidth',5);
+    end
 end
 ylabel('\omega (deg/s)'); title('Angular Rate per Axis');
 legend('\omega_x','\omega_y','\omega_z');
@@ -470,7 +659,9 @@ subplot(2,1,1)
     % Marcadores de transición de estado
     if ~isnan(t_event_first)
         xline(t_event_first/3600, '--m', 'Settling', 'LabelVerticalAlignment', 'bottom');
-        xline((t_event_first + 3600)/3600, '--c', 'Alignment', 'LabelVerticalAlignment', 'bottom');
+        if settings.enable_alignment
+            xline((t_event_first + settings.alignment_wait_time)/3600, '--c', 'Alignment', 'LabelVerticalAlignment', 'bottom');
+        end
     end
     
     ylabel('Torque (mN.m)');
@@ -484,7 +675,9 @@ subplot(2,1,2)
     
     if ~isnan(t_event_first)
         xline(t_event_first/3600, '--m');
-        xline((t_event_first + 3600)/3600, '--c');
+        if settings.enable_alignment
+            xline((t_event_first + settings.alignment_wait_time)/3600, '--c');
+        end
     end
     
     xlabel('Time (h)'); ylabel('|T| (mN.m)');
@@ -558,28 +751,77 @@ end
 
 %% ==================== FUNCIONES LOCALES ====================
 
+function [detumble_time_h, first_cross_time_h, energy_j, time_h, omega_mag_deg] = runFastState1McIteration(mc_iter, initial, nominal_Is, sat, orbit, B_avg, env, disturbance, sensors, settings, ctrl, actuators)
+% RUNFASTSTATE1MCITERATION Ejecuta una corrida independiente para parfor.
+    rng(mc_iter, 'twister');
+
+    initial_run = initial;
+    sat_run = sat;
+    ctrl_run = ctrl;
+    settings_run = settings;
+
+    initial_run.omega.omega0_x = deg2rad(10 * rand() - 5);
+    initial_run.omega.omega0_y = deg2rad(10 * rand() - 5);
+    initial_run.omega.omega0_z = deg2rad(10 * rand() - 5);
+
+    err_Is = 0.10 * randn(3,3);
+    err_Is = (err_Is + err_Is')/2;
+    sat_run.Is = nominal_Is .* (1 + err_Is);
+
+    ctrl_run.k_bdot = (4 * pi / orbit.period) * (1 + sin(deg2rad(orbit.inclination))) * min(diag(sat_run.Is)) / (B_avg^2);
+
+    B_in_ref0 = interp1(env.time, env.B_inertial, 0, 'linear', 'extrap')';
+    B_filt0 = quatRotation(quatconj(initial_run.attitude.q0123_0'), B_in_ref0);
+
+    settings_run.X0 = [initial_run.attitude.q0123_0; ...
+                       initial_run.omega.omega0_x; initial_run.omega.omega0_y; initial_run.omega.omega0_z; ...
+                       0; 0; 0; ...
+                       initial_run.omega.omega0_x; initial_run.omega.omega0_y; initial_run.omega.omega0_z; ...
+                       B_filt0; ...
+                       0; 0; 0];
+
+    eventFcn = @(t,x) detumblingEvent(t, x, settings_run);
+    opts = odeset('RelTol', 1e-6, 'Events', eventFcn);
+
+    [tout, x] = ode45(@(t,x) satellite_detumbling(t, x, sat_run, disturbance, sensors, settings_run, env, ctrl_run, actuators), ...
+                      [0 settings_run.t_final], settings_run.X0, opts);
+
+    omega_norm = vecnorm(x(:,5:7), 2, 2);
+    idx_first_cross = find(omega_norm <= settings_run.detumble_threshold, 1, 'first');
+    idx_stable = findStableDetumbleIndex(tout, omega_norm, settings_run);
+
+    if isempty(idx_first_cross)
+        first_cross_time_h = NaN;
+    else
+        first_cross_time_h = tout(idx_first_cross) / 3600;
+    end
+
+    if isempty(idx_stable)
+        detumble_time_h = NaN;
+    else
+        detumble_time_h = tout(idx_stable) / 3600;
+    end
+
+    energy_j = NaN;
+    time_h = tout / 3600;
+    omega_mag_deg = rad2deg(omega_norm);
+end
+
 function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, ctrl, actuators)
 % SATELLITE_DETUMBLING  Dinámica rígida + control magnético PID
     
-    % --- Variables Persistentes para Lógica de Estados e IMU ---
-    persistent state_ant t_prev bias_g w_filt mag_noise B_filt
+    % --- Variables Persistentes para Lógica de Estados ---
+    persistent state_ant
     
     if isempty(state_ant)
         state_ant = 0; % Estado inicial: Detumbling
-        t_prev = t;
-        bias_g = [0;0;0]; % b_g(t=0) Bias inicial
-        w_filt = x(5:7);  % Inicializamos el filtro digital para evitar picos
-        mag_noise = [0;0;0];
-        B_in_ref0 = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')';
-        B_filt = quatRotation(quatconj(x(1:4)'), B_in_ref0);
     end
     
     integral_error = x(8:10); % Variable de estado proveniente del ode45
+    w_filt = x(11:13);        % Filtro del Giroscopio 
+    B_filt = x(14:16);        % Filtro del Magnetómetro
+    bias_g = x(17:19);        % Error Bias continuo
     d_int = [0;0;0];          % Derivada inicial del integrador del PID
-    
-    % Calculamos dt explícito para el Random Walk y el filtro discreto de la IMU
-    dt = t - t_prev;
-    if dt < 0; dt = 0; end % Prevenir pasos hacia atrás de ode45
     
     % 1) Interpolación del entorno
     B_inertial_ref = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')'; 
@@ -590,15 +832,14 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
     B_body_true = quatRotation(quatconj(q'), B_inertial_ref); 
     
     % 3) Computadora de abordo (Determina el Estado)
-    state = onboardComputer(t, state_ant, x);
+    if t <= eps
+        state_ant = 0;
+    end
+    state = onboardComputer(t, state_ant, x, settings);
     
-    % Sensor (ruido congelado + cuantización + filtro pasa-bajo)
-    [B_body_meas, mag_noise, B_filt] = imu_mag_model(B_body_true, dt, mag_noise, B_filt, sensors);
-
-    % IMU (Medición para TODOS los estados)
-    [w_meas, bias_g, w_filt] = imu_gyro_model(x(5:7), dt, bias_g, w_filt, sensors);
-    state_meas = x;
-    state_meas(5:7) = w_meas;
+    % Sensor (Filtros continuos integrados matemáticamente por ode45)
+    [B_body_meas, d_B_filt] = imu_mag_model_continuous(B_body_true, B_filt, sensors, t);
+    [w_meas, d_w_filt, d_bias_g] = imu_gyro_model_continuous(x(5:7), w_filt, bias_g, sensors, t);
 
     % --- LÓGICA DE CONTROL ---
     if state == 0 || state == 1 
@@ -669,15 +910,10 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
     
     % 8) Dinamicas del satelite
     x_dot_dyn = satellite_dynamics(x, sat, T_total);
-    x_dot = [x_dot_dyn; d_int]; % Añadimos la integración del PID al vector
+    x_dot = [x_dot_dyn; d_int; d_w_filt; d_B_filt; d_bias_g]; % Sumamos todas las derivadas
     
     % 9) Update state
     state_ant = state;
-    
-    % Actualizar tiempo para la IMU si el solver avanzó
-    if dt > 0
-        t_prev = t;
-    end
 end
 
 function [Tc, muB_sat] = detumblingControl_PureBDot(B_dot, k, B_body, actuators)
@@ -693,31 +929,59 @@ function [Tc, muB_sat] = detumblingControl_PureBDot(B_dot, k, B_body, actuators)
     Tc = cross(muB_sat, B_body);
 end
 
-function [B_meas, noise_new, B_filt_new] = imu_mag_model(B_true, dt, noise_old, B_filt_old, sensors)
-% IMU_MAG_MODEL Simula ruido, cuantización y filtro pasa-bajo del magnetómetro
-    
-    % 1. Generación de ruido (congelado en sub-pasos de ode45)
-    if dt > 0
-        eta_m = sensors.mag.desvEst * randn(3,1);
-        noise_new = eta_m;
-    else
-        noise_new = noise_old;
+function [value, isterminal, direction] = detumblingEvent(t, x, settings)
+% DETUMBLINGEVENT Detiene la simulacion solo si el estado 1 permanece estable.
+    persistent t_state1_candidate
+
+    if isempty(t_state1_candidate) || t <= eps
+        t_state1_candidate = NaN;
     end
-    
-    B_raw = B_true(:) + noise_new;
-    
-    % 2. Cuantización (Resolución del sensor)
-    B_quant = round(B_raw ./ sensors.mag.res) .* sensors.mag.res;
-    
-    % 3. Filtro Pasa-Bajo Digital
-    if dt > 0
-        alpha = dt / (sensors.mag.tau + dt);
-        B_filt_new = (1 - alpha) * B_filt_old(:) + alpha * B_quant;
-    else
-        B_filt_new = B_filt_old(:); 
+
+    omega_norm = norm(x(5:7));
+    if omega_norm <= settings.detumble_threshold && isnan(t_state1_candidate)
+        t_state1_candidate = t;
+    elseif omega_norm > settings.detumble_exit_threshold
+        t_state1_candidate = NaN;
     end
+
+    if isnan(t_state1_candidate)
+        value = 1;
+    else
+        value = (t - t_state1_candidate) - settings.state1_hold_time;
+    end
+    isterminal = settings.stop_at_state1;
+    direction = 1;
+end
+
+function idx_stable = findStableDetumbleIndex(t, omega_norm, settings)
+% FINDSTABLEDETUMBLEINDEX Verifica permanencia bajo umbral con histeresis.
+    idx_stable = [];
+    t_candidate = NaN;
+
+    for idx = 1:numel(t)
+        if omega_norm(idx) <= settings.detumble_threshold && isnan(t_candidate)
+            t_candidate = t(idx);
+        elseif omega_norm(idx) > settings.detumble_exit_threshold
+            t_candidate = NaN;
+        end
+
+        if ~isnan(t_candidate) && (t(idx) - t_candidate) >= settings.state1_hold_time
+            idx_stable = idx;
+            return;
+        end
+    end
+end
+
+function [B_meas, B_filt_dot] = imu_mag_model_continuous(B_true, B_filt, sensors, t)
+% IMU_MAG_MODEL_CONTINUOUS Simula ruido y filtro pasa-bajo en tiempo continuo
+    % Usamos un ruido pseudo-aleatorio suave para evitar discontinuidades 
+    % que harían que ode45 (de paso variable) reduzca su velocidad a casi cero.
+    noise_nT = sensors.mag.desvEst * [sin(t*50); cos(t*60); sin(t*70)];
+    B_raw = B_true(:) + noise_nT;
     
-    B_meas = B_filt_new;
+    % Filtro Pasa-Bajo Analógico en Tiempo Continuo (dy/dt = (x - y)/tau)
+    B_filt_dot = (B_raw - B_filt) / sensors.mag.tau;
+    B_meas = B_filt; 
 end
 
 function rotX = quatRotation(q, x)
@@ -825,7 +1089,7 @@ function x_dot = satellite_dynamics(x, sat, T_total)
     x_dot = [q_dot; w_dot];
 end
 
-function state = onboardComputer(t, state_ant, x)
+function state = onboardComputer(t, state_ant, x, settings)
     w = x(5:7);
     threshold = deg2rad(1); % Umbral de 1 deg/s
     
@@ -833,20 +1097,25 @@ function state = onboardComputer(t, state_ant, x)
     persistent t_event
     
     % Inicialización de t_event si está vacío
-    if isempty(t_event)
+    if isempty(t_event) || (t <= eps && state_ant == 0)
         t_event = -1; 
     end
 
     % LÓGICA DE TRANSICIÓN
-    if state_ant == 0 && norm(w) < threshold
+    if state_ant == 0 && norm(w) <= threshold
         % HIT: Se alcanzó la velocidad por primera vez
         state = 1;
         t_event = t; % Guardamos el tiempo exacto del evento
         fprintf('At t=%.2f s: Target reached. State 0 -> 1. Timer started.\n', t);
         
     elseif state_ant == 1
-        % Nos mantenemos en el Estado 1 indefinidamente (Solo Detumbling)
-        state = 1; 
+        % Espera posterior al detumbling antes de pasar al modo nominal.
+        if settings.enable_alignment && t_event >= 0 && (t - t_event) >= settings.alignment_wait_time
+            state = 2;
+            fprintf('At t=%.2f s: Settling complete. State 1 -> 2. Alignment started.\n', t);
+        else
+            state = 1;
+        end
         
     else
         state = state_ant; % Mantener el estado actual (Estado 2 u otros)
@@ -881,10 +1150,8 @@ function [M_real, I_real] = magnetorquer_model(M_cmd, actuators)
     M_real = max(min(M_core, M_max), -M_max);
 end
 
-function [w_meas, bias_new, w_filt_new] = imu_gyro_model(w_true, dt, bias_old, w_filt_old, sensors)
-% IMU_GYRO_MODEL Simula los errores matemáticos de un giroscopio
-
-    % 1. Matrices de Error (Ecuación 1)
+function [w_meas, w_filt_dot, bias_dot] = imu_gyro_model_continuous(w_true, w_filt, bias, sensors, t)
+% IMU_GYRO_MODEL_CONTINUOUS Simula errores de giroscopio en tiempo continuo
     s = sensors.gyro.scaleFactor;
     m = sensors.gyro.misalign;
     
@@ -893,32 +1160,16 @@ function [w_meas, bias_new, w_filt_new] = imu_gyro_model(w_true, dt, bias_old, w
             m(2,1), 1,      m(2,3);
             m(3,1), m(3,2), 1];
             
-    % 2. Ruido e inestabilidad del Bias (Ecuaciones 2 y 3)
-    eta_g = sensors.gyro.noiseStd * randn(3,1);
+    % Ruido suave de alta frecuencia
+    eta_g = sensors.gyro.noiseStd * [sin(t*55); cos(t*65); sin(t*75)];
     
-    if dt > 0
-        eta_bg = sensors.gyro.biasWalkStd * sqrt(dt) * randn(3,1);
-        bias_new = bias_old + eta_bg;
-    else
-        bias_new = bias_old; % El tiempo no ha avanzado
-    end
+    % Inestabilidad (Random walk) modelada como derivada
+    bias_dot = sensors.gyro.biasWalkStd * [cos(t*10); sin(t*12); cos(t*15)];
     
-    w_raw = T_ma * T_sf * w_true + bias_new + eta_g;
-    
-    % 3. ADC: Saturación y Cuantización Digital (Ecuaciones 7, 8 y 9)
+    w_raw = T_ma * T_sf * w_true + bias + eta_g;
     w_sat = max(min(w_raw, sensors.gyro.yMax), sensors.gyro.yMin);
     
-    levels = 2^sensors.gyro.bits - 1;
-    D_out = round( levels * (w_sat - sensors.gyro.yMin) / (sensors.gyro.yMax - sensors.gyro.yMin) );
-    w_adc = sensors.gyro.yMin + ((sensors.gyro.yMax - sensors.gyro.yMin) / levels) * D_out;
-    
-    % 4. Filtro Pasa-Bajo Digital (Ecuación 4)
-    if dt > 0
-        alpha = dt / (sensors.gyro.tau + dt);
-        w_filt_new = (1 - alpha) * w_filt_old + alpha * w_adc;
-    else
-        w_filt_new = w_filt_old; 
-    end
-    
-    w_meas = w_filt_new;
+    % Filtro Pasa-Bajo Continuo
+    w_filt_dot = (w_sat - w_filt) / sensors.gyro.tau;
+    w_meas = w_filt;
 end
