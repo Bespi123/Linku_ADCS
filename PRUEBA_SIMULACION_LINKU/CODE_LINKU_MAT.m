@@ -84,7 +84,10 @@ settings.orbit_period = orbit.period;
 settings.X0 = [initial.attitude.q0123_0;
                initial.omega.omega0_x;
                initial.omega.omega0_y;
-               initial.omega.omega0_z];
+               initial.omega.omega0_z;
+               0; % Integral error X
+               0; % Integral error Y
+               0];% Integral error Z
 
 %% 5) Configuracion de computadora de abordo
 state_ant = 0;
@@ -427,18 +430,17 @@ linkaxes(findall(gcf,'type','axes'),'x');
 function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
 % SATELLITE_DETUMBLING  Dinámica rígida + control magnético PID
     
-    % --- Variables Persistentes para Lógica de Estados e Integrador ---
-    persistent state_ant integral_error t_prev
+    % --- Variables Persistentes para Lógica de Estados ---
+    % NOTA: state_ant se mantiene aquí temporalmente. Para eliminarlo por completo, 
+    % se debería usar la función "Events" de ode45 para pausar y reiniciar la simulación.
+    persistent state_ant 
     
     if isempty(state_ant)
         state_ant = 0; % Estado inicial: Detumbling
     end
-    if isempty(integral_error)
-        integral_error = [0; 0; 0]; % Acumulador del error (Vector 3x1)
-    end
-    if isempty(t_prev)
-        t_prev = 0;
-    end
+    
+    integral_error = x(8:10); % Recuperamos la integral desde el solver
+    d_integral = [0; 0; 0];   % Inicializamos la derivada de la integral
     
     % 1) Interpolación del entorno
     B_inertial_ref = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')'; 
@@ -461,8 +463,8 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
     % --- LÓGICA DE CONTROL ---
     if state == 0 || state == 1 
         % >> Estado 0/1: B-Dot (Detumbling)
-        % Reiniciamos el integrador para que empiece limpio en el Estado 2
-        integral_error = [0; 0; 0]; 
+        % Mantenemos la derivada de la integral en 0
+        d_integral = [0; 0; 0]; 
         
         k = 2 * omega_orbit * (1 + sin(deg2rad(dip_ref))) * min_inertia * 8e9;
         [T_control, ~] = detumblingControl(x, k, B_body_meas); 
@@ -487,15 +489,11 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
                 u = [0.1; 0; 0]; % Empujón para salir del equilibrio inestable
             end
             
-            % D. Cálculo del Término Integral (PID)
-            dt = t - t_prev;
-            if dt < 0, dt = 0; end % Protección contra pasos atrás del solver
-            
-            % Acumulación (Integración de Euler)
-            integral_error = integral_error + u * dt;
+            % D. Pasamos la derivada al vector de estado para que ode45 la integre
+            % Matemáticamente, la derivada del error integral es el error mismo (u)
+            d_integral = u;
             
             % Anti-Windup: Limitar el error integral para que no crezca infinito
-            % Esto evita oscilaciones excesivas cuando el actuador se satura
             limit_int = 50; 
             integral_error = max(min(integral_error, limit_int), -limit_int);
 
@@ -517,9 +515,6 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
         end 
     end
     
-    % Actualizar tiempo previo para el siguiente paso
-    t_prev = t;
-
     % 6) Disturbios
     T_dist = dist(t); T_dist = T_dist(:);
     
@@ -527,7 +522,8 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env)
     T_total = T_dist + T_control;
     
     % 8) Dinamicas del satelite
-    x_dot = satellite_dynamics(x, sat, T_total);
+    x_dot_dyn = satellite_dynamics(x, sat, T_total);
+    x_dot = [x_dot_dyn; d_integral]; % Vector de salida 10x1
     
     % 9) Update state
     state_ant = state;

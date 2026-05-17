@@ -108,6 +108,8 @@ ctrl.Ki = 5e-5; % Incrementado 100x para vencer la remanencia del núcleo y pert
 ctrl.Kd = 3e-3;
 ctrl.limit_int = 50;
 ctrl.bang_bang_factor = 1e3; % Factor multiplicador para forzar frenado agresivo
+ctrl.pointing.P = ctrl.Kd * eye(3); % Ganancia de error de velocidad angular para feedback quaternion
+ctrl.pointing.K = ctrl.Kp * eye(3); % Ganancia de error de actitud para feedback quaternion
 
 % Ganancia teórica para el controlador B-Dot (Cross-Product)
 % K_bdot = [4*pi*(1+sin(i))*I_min] / [T_orb * B_avg^2]
@@ -118,21 +120,24 @@ ctrl.k_bdot = (4 * pi / orbit.period) * (1 + sin(deg2rad(orbit.inclination))) * 
 settings.startTime = datetime(2025,10,10,23,30,00);
 settings.startTime.TimeZone = "UTC";
 
-settings.number_of_orbits = 10; % 10 órbitas para dar margen físico de frenado
+settings.number_of_orbits = 3; % 10 órbitas para dar margen físico de frenado
 settings.sample_step = 100;
 settings.t_final = orbit.period * settings.number_of_orbits;
 settings.orbit_period = orbit.period;                 
-settings.enable_alignment = false; % false: evaluar solo el paso 0 -> 1 y permanecer en detumbling
-settings.stop_at_state1 = true; % true: detener ode45 cuando |omega| < 1 deg/s
-settings.fast_state1_eval = true; % true: omite reconstruccion pesada de senales tras ode45
-settings.use_parallel_mc = true; % true: usa parfor para Monte Carlo en modo fast_state1_eval
+settings.enable_alignment = true; % true: tras detumbling pasa al modo pointing/alineamiento
+settings.stop_at_state1 = false; % true: detener ode45 cuando |omega| < 1 deg/s
+settings.fast_state1_eval = false; % true: omite reconstruccion pesada de senales tras ode45
+settings.use_parallel_mc = false; % true: usa parfor para Monte Carlo en modo fast_state1_eval
+settings.initial_state = 2; % 0: detumbling normal, 2: arranque directo en pointing
 settings.detumble_threshold = deg2rad(1);
 settings.detumble_exit_threshold = deg2rad(1.2); % Histeresis: si sube de esto, se reinicia la verificacion
 settings.state1_hold_time = 3600; % Tiempo minimo estable antes de aceptar estado 1 [s]
-settings.alignment_wait_time = 3600; % Tiempo de espera tras detumbling antes de alineamiento [s]
+settings.alignment_wait_time = 600; % Tiempo de espera tras detumbling antes de alineamiento [s]
+settings.save_results = true;
+settings.results_dir = 'results';
 
 %% 5) Configuracion de computadora de abordo
-state_ant = 0;
+state_ant = settings.initial_state;
 
 %% Escenario Satelital (SGP4)
 sc = satelliteScenario(settings.startTime, settings.startTime + seconds(settings.t_final), settings.sample_step);
@@ -221,8 +226,7 @@ env.dip = dip;                       % Nx1 en grados (según wrldmagm)
 disp('Pre-cálculo completado.');
 
 %% 6) MONTE CARLO & SIMULACIÓN (ODE45)
-num_mc_runs = 50; % Cambiar a 1 para simulación única, >1 para Monte Carlo
-
+num_mc_runs = 1; % Pointing verification run; raise this manually for Monte Carlo.
 mc_detumble_times = NaN(num_mc_runs, 1);
 mc_first_cross_times = NaN(num_mc_runs, 1);
 mc_energy = NaN(num_mc_runs, 1);
@@ -261,9 +265,15 @@ for mc_iter = 1:num_mc_runs
     fprintf('\n--- Iteración Monte Carlo %d / %d ---\n', mc_iter, num_mc_runs);
     
     % 1. Aleatorizar Condiciones (Tasas de eyección realistas: entre -5 y +5 deg/s)
-    initial.omega.omega0_x = deg2rad(10 * rand() - 5);
-    initial.omega.omega0_y = deg2rad(10 * rand() - 5);
-    initial.omega.omega0_z = deg2rad(10 * rand() - 5);
+    if settings.initial_state == 2
+        initial.omega.omega0_x = 0;
+        initial.omega.omega0_y = 0;
+        initial.omega.omega0_z = 0;
+    else
+        initial.omega.omega0_x = deg2rad(10 * rand() - 5);
+        initial.omega.omega0_y = deg2rad(10 * rand() - 5);
+        initial.omega.omega0_z = deg2rad(10 * rand() - 5);
+    end
     
     % 2. Aleatorizar Tensor de Inercia (+/- 10% de variación gaussiana)
     err_Is = 0.10 * randn(3,3);
@@ -289,7 +299,7 @@ for mc_iter = 1:num_mc_runs
     fprintf('  Tasas de giro iniciales (X, Y, Z)  : [%.2f, %.2f, %.2f] deg/s\n', rad2deg(initial.omega.omega0_x), rad2deg(initial.omega.omega0_y), rad2deg(initial.omega.omega0_z));
 
     % 4. Ejecutar Integrador
-    if settings.stop_at_state1
+    if settings.stop_at_state1 && settings.initial_state ~= 2
         eventFcn = @(t,x) detumblingEvent(t, x, settings);
     else
         eventFcn = [];
@@ -354,11 +364,13 @@ Currents       = zeros(3, len_out);
 Power_inst     = zeros(1, len_out);
 state_rec      = zeros(1, len_out);
 pointing_error = zeros(1, len_out);
+quat_error = zeros(4, len_out);
+quat_error_angle = zeros(1, len_out);
 T_dist_rec     = zeros(3, len_out);
 K_gain_rec     = zeros(1, len_out);
 
 % Logic variables
-state_ant_post = 0;
+state_ant_post = settings.initial_state;
 t_event_post = -1;
 t_event_first = NaN; 
 
@@ -366,7 +378,6 @@ for i = 1:len_out
     t_curr = tout(i);
     q_curr = x(i, 1:4)'; 
     w_curr = x(i, 5:7)'; 
-    int_err_curr = x(i, 8:10)'; % Recuperamos el error integrado por ode45
     
     % --- Onboard Computer State Logic ---
     if state_ant_post == 0 && norm(w_curr) <= settings.detumble_threshold
@@ -407,27 +418,25 @@ for i = 1:len_out
         [T_applied, M_applied] = detumblingControl_PureBDot(B_dot_post, k_val, B_body_meas(:,i), actuators);
         [~, curr_vec] = magnetorquer_model(M_applied, actuators); % Extraer corriente real consumida
     else
-        % PD Control for Nominal Alignment (State 2)
+        % Quaternion feedback control for nominal alignment (State 2)
         v_vel_eci = interp1(env.time, env.Vel_inertial', t_curr, 'linear', 'extrap')';
         v_vel_body = quatRotation(quatconj(q_curr'), v_vel_eci/norm(v_vel_eci));
-        pointing_error(i) = rad2deg(acos(dot([0;0;1], v_vel_body)));
+        pointing_error(i) = rad2deg(acos(max(min(dot([0;0;1], v_vel_body), 1), -1)));
         
-        error_vec = cross([0;0;1], v_vel_body);
-        dot_product = dot([0;0;1], v_vel_body);
-        if dot_product < -0.99 && norm(error_vec) < 1e-4
-            % Inyectamos un pequeño error ficticio en X para forzar el giro
-            error_vec = [0.1; 0; 0]; 
-        end
-        
-        % Reconstruimos T_pid deseado
-        int_err_sat = max(min(int_err_curr, ctrl.limit_int), -ctrl.limit_int);
-        T_pid_desired = (ctrl.Kp * error_vec) + (ctrl.Ki * int_err_sat) - (ctrl.Kd * w_meas);
+        r_ref_eci = interp1(env.time, env.Pos_inertial', t_curr, 'linear', 'extrap')';
+        h_ref_eci = cross(r_ref_eci, v_vel_eci);
+        dq = pointingErrorQuaternion([0;0;1], v_vel_body);
+        quat_error(:,i) = dq;
+        quat_error_angle(i) = rad2deg(2 * atan2(norm(dq(2:4)), abs(dq(1))));
+        Wr = quatRotation(quatconj(q_curr'), h_ref_eci / max(norm(r_ref_eci)^2, eps));
+        Wr_dot = [0;0;0];
+        T_desired = ControlFeedback_rw(sat.Is, w_meas, dq, Wr, Wr_dot, ctrl.pointing.P, ctrl.pointing.K);
         
         % Reconstruimos el Cross-Product Steering
         B_meas = B_body_meas(:,i);
         B_norm_sq = norm(B_meas)^2;
         if B_norm_sq > 1e-15
-            M_cmd = cross(B_meas, T_pid_desired) / B_norm_sq;
+            M_cmd = cross(B_meas, T_desired) / B_norm_sq;
         else
             M_cmd = [0;0;0];
         end
@@ -563,6 +572,27 @@ t_hours = tout / 3600;
 q0123out = x(:, 1:4); % Cuaterniones [Nx4]
 pqrout   = x(:, 5:7); % Velocidades angulares [Nx3]
 
+if settings.save_results
+    if ~isfolder(settings.results_dir)
+        mkdir(settings.results_dir);
+    end
+
+    run_timestamp = char(datetime('now', 'Format', 'yyyyMMdd_HHmmss'));
+    result_file = fullfile(settings.results_dir, ['linku_run_' run_timestamp '.mat']);
+
+    save(result_file, ...
+        'tout', 'x', 't_hours', 'q0123out', 'pqrout', ...
+        'xyzout', 'xyzout_dot', ...
+        'B_body_meas', 'B_body_true_rec', ...
+        'Torque_ctrl', 'Mag_moment', 'Currents', 'Power_inst', ...
+        'state_rec', 'pointing_error', 'quat_error', 'quat_error_angle', 'T_dist_rec', 'K_gain_rec', ...
+        'mc_detumble_times', 'mc_first_cross_times', 'mc_energy', ...
+        'settings', 'ctrl', 'sat', 'orbit', 'initial', 'env', ...
+        '-v7.3');
+
+    fprintf('Resultados guardados en: %s\n', result_file);
+end
+
 % Plot 7: Posición y Velocidad Orbital (ECI)
 figure('Name','Orbital States (Position & Velocity)','Color','w');
 subplot(2,1,1)
@@ -641,14 +671,35 @@ plot(t_hours, pointing_error, 'g', 'LineWidth', 1.2); grid on;
 ylabel('Error (deg)'); title('Z-Axis to V-bar Pointing Error (State 2)');
 xlabel('Time (h)');
 
-% Figure 3: Environment Disturbance
+% Figure 3: Quaternion Error
+figure('Name','Quaternion Pointing Error','Color','w');
+axq1 = subplot(2,1,1);
+plot(t_hours, quat_error_angle, 'k', 'LineWidth', 1.5); grid on; hold on;
+if ~isnan(t_event_first) && settings.enable_alignment
+    xline((t_event_first + settings.alignment_wait_time)/3600, '--c', 'Alignment Start', 'LabelVerticalAlignment', 'bottom');
+end
+ylabel('Angle (deg)');
+title('Equivalent Quaternion Error Angle');
+
+axq2 = subplot(2,1,2);
+plot(t_hours, quat_error(2:4,:)', 'LineWidth', 1.2); grid on; hold on;
+if ~isnan(t_event_first) && settings.enable_alignment
+    xline((t_event_first + settings.alignment_wait_time)/3600, '--c', 'Alignment Start', 'LabelVerticalAlignment', 'bottom');
+end
+xlabel('Time (h)');
+ylabel('dq vector');
+title('Quaternion Error Vector Components');
+legend('dq_1','dq_2','dq_3', 'Location', 'eastoutside');
+linkaxes([axq1, axq2], 'x');
+
+% Figure 4: Environment Disturbance
 figure('Name','Environmental Disturbances','Color','w');
 plot(t_hours, T_dist_rec'*1e3, 'LineWidth', 1.1); grid on;
 ylabel('Torque (mNm)'); xlabel('Time (h)');
 title('External Disturbances (Gravity Gradient, etc.)');
 legend('T_x','T_y','T_z');
 
-% Figure 4: Torque de Control Reconstruido
+% Figure 5: Torque de Control Reconstruido
 figure('Name','Control Torque Analysis','Color','w');
 subplot(2,1,1)
     % Plot del torque por ejes (X, Y, Z) en mNm para mejor escala
@@ -760,9 +811,15 @@ function [detumble_time_h, first_cross_time_h, energy_j, time_h, omega_mag_deg] 
     ctrl_run = ctrl;
     settings_run = settings;
 
-    initial_run.omega.omega0_x = deg2rad(10 * rand() - 5);
-    initial_run.omega.omega0_y = deg2rad(10 * rand() - 5);
-    initial_run.omega.omega0_z = deg2rad(10 * rand() - 5);
+    if settings_run.initial_state == 2
+        initial_run.omega.omega0_x = 0;
+        initial_run.omega.omega0_y = 0;
+        initial_run.omega.omega0_z = 0;
+    else
+        initial_run.omega.omega0_x = deg2rad(10 * rand() - 5);
+        initial_run.omega.omega0_y = deg2rad(10 * rand() - 5);
+        initial_run.omega.omega0_z = deg2rad(10 * rand() - 5);
+    end
 
     err_Is = 0.10 * randn(3,3);
     err_Is = (err_Is + err_Is')/2;
@@ -780,7 +837,11 @@ function [detumble_time_h, first_cross_time_h, energy_j, time_h, omega_mag_deg] 
                        B_filt0; ...
                        0; 0; 0];
 
-    eventFcn = @(t,x) detumblingEvent(t, x, settings_run);
+    if settings_run.stop_at_state1 && settings_run.initial_state ~= 2
+        eventFcn = @(t,x) detumblingEvent(t, x, settings_run);
+    else
+        eventFcn = [];
+    end
     opts = odeset('RelTol', 1e-6, 'Events', eventFcn);
 
     [tout, x] = ode45(@(t,x) satellite_detumbling(t, x, sat_run, disturbance, sensors, settings_run, env, ctrl_run, actuators), ...
@@ -814,10 +875,9 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
     persistent state_ant
     
     if isempty(state_ant)
-        state_ant = 0; % Estado inicial: Detumbling
+        state_ant = settings.initial_state;
     end
     
-    integral_error = x(8:10); % Variable de estado proveniente del ode45
     w_filt = x(11:13);        % Filtro del Giroscopio 
     B_filt = x(14:16);        % Filtro del Magnetómetro
     bias_g = x(17:19);        % Error Bias continuo
@@ -825,7 +885,6 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
     
     % 1) Interpolación del entorno
     B_inertial_ref = interp1(env.time, env.B_inertial, t, 'linear', 'extrap')'; 
-    dip_ref        = interp1(env.time, env.dip,        t, 'linear', 'extrap');
     
     % 2) Rotación inercial -> body
     q = x(1:4);
@@ -833,7 +892,7 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
     
     % 3) Computadora de abordo (Determina el Estado)
     if t <= eps
-        state_ant = 0;
+        state_ant = settings.initial_state;
     end
     state = onboardComputer(t, state_ant, x, settings);
     
@@ -862,28 +921,19 @@ function x_dot = satellite_detumbling(t, x, sat, dist, sensors, settings, env, c
             v_target_body = quatRotation(q_inv, v_desired_eci);
             z_body = [0; 0; 1];
             
-            % B. Cálculo del Error Proporcional (Vector u)
-            u = cross(z_body, v_target_body); % Dirección y magnitud del error (sen(theta))
-            
-            % C. Corrección de Singularidad (180 grados)
-            dot_product = dot(z_body, v_target_body);
-            if dot_product < -0.99 && norm(u) < 1e-4
-                u = [0.1; 0; 0]; % Empujón para salir del equilibrio inestable
-            end
-            
-            % D. Pasamos la derivada del error a ode45 para que lo integre
-            d_int = u; 
-            
-            % E. Anti-Windup (Limitamos su acción)
-            int_err_sat = max(min(integral_error, ctrl.limit_int), -ctrl.limit_int);
-            
-            % F. Ley de Control PID Ideal (Torque deseado)
-            T_pid_desired = (ctrl.Kp * u) + (ctrl.Ki * int_err_sat) - (ctrl.Kd * w_meas); 
+            r_ref_eci = interp1(env.time, env.Pos_inertial', t, 'linear', 'extrap')';
+            v_ref_eci = interp1(env.time, env.Vel_inertial', t, 'linear', 'extrap')';
+            h_ref_eci = cross(r_ref_eci, v_ref_eci);
+            dq = pointingErrorQuaternion(z_body, v_target_body);
+            Wr = quatRotation(q_inv, h_ref_eci / max(norm(r_ref_eci)^2, eps));
+            Wr_dot = [0; 0; 0];
+            d_int = [0; 0; 0];
+            T_desired = ControlFeedback_rw(sat.Is, w_meas, dq, Wr, Wr_dot, ctrl.pointing.P, ctrl.pointing.K);
             
             % G. CROSS-PRODUCT STEERING: Traducir Torque Deseado a Dipolo Real (Magnetorquers)
             B_norm_sq = norm(B_body_meas)^2;
             if B_norm_sq > 1e-15
-                M_cmd = cross(B_body_meas, T_pid_desired) / B_norm_sq;
+                M_cmd = cross(B_body_meas, T_desired) / B_norm_sq;
             else
                 M_cmd = [0;0;0];
             end
@@ -927,6 +977,55 @@ function [Tc, muB_sat] = detumblingControl_PureBDot(B_dot, k, B_body, actuators)
     [muB_sat, ~] = magnetorquer_model(muB, actuators);
 
     Tc = cross(muB_sat, B_body);
+end
+
+function U = ControlFeedback_rw(I, W, dq, Wr, Wr_dot, P, K)
+% CONTROLFEEDBACK_RW  Torque ideal de pointing por feedback de cuaternion.
+    W = W(:);
+    Wr = Wr(:);
+    Wr_dot = Wr_dot(:);
+    dq13 = dq(2:4);
+    dW = W - Wr;
+
+    U = -P * dW - K * dq13 + skewMatrix(W) * I * W + I * (Wr_dot - skewMatrix(W) * Wr);
+end
+
+function dq = pointingErrorQuaternion(body_axis, target_body)
+% POINTINGERRORQUATERNION  Error que lleva body_axis hacia target_body.
+    body_axis = body_axis(:) / norm(body_axis);
+    target_body = target_body(:) / norm(target_body);
+
+    err_axis = cross(body_axis, target_body);
+    err_norm = norm(err_axis);
+    dot_val = max(min(dot(body_axis, target_body), 1), -1);
+
+    if err_norm < 1e-10
+        if dot_val > 0
+            dq = [1; 0; 0; 0];
+        else
+            fallback_axis = [1; 0; 0];
+            if abs(dot(body_axis, fallback_axis)) > 0.9
+                fallback_axis = [0; 1; 0];
+            end
+            err_axis = cross(body_axis, fallback_axis);
+            err_axis = err_axis / norm(err_axis);
+            dq = [0; -err_axis];
+        end
+        return;
+    end
+
+    err_axis = err_axis / err_norm;
+    err_angle = atan2(err_norm, dot_val);
+
+    % Signo elegido para que -K*dq(2:4) tenga el mismo sentido que cross(axis,target).
+    dq = [cos(0.5 * err_angle); -err_axis * sin(0.5 * err_angle)];
+end
+
+function S = skewMatrix(v)
+    v = v(:);
+    S = [0, -v(3), v(2);
+         v(3), 0, -v(1);
+        -v(2), v(1), 0];
 end
 
 function [value, isterminal, direction] = detumblingEvent(t, x, settings)
@@ -1096,9 +1195,13 @@ function state = onboardComputer(t, state_ant, x, settings)
     % Variables que sobreviven entre llamadas de ode45
     persistent t_event
     
-    % Inicialización de t_event si está vacío
-    if isempty(t_event) || (t <= eps && state_ant == 0)
-        t_event = -1; 
+    % InicializaciÃ³n de t_event si estÃ¡ vacÃ­o
+    if isempty(t_event) || t <= eps
+        if settings.initial_state == 1
+            t_event = t;
+        else
+            t_event = -1;
+        end
     end
 
     % LÓGICA DE TRANSICIÓN
